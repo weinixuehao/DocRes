@@ -11,7 +11,9 @@ from itertools import cycle
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils import data
+from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist 
 from torch.utils.data.distributed import DistributedSampler 
 from torch.nn.parallel import DistributedDataParallel as DDP 
@@ -42,6 +44,8 @@ def getBasecoord(h,w):
     return base_coord
 
 def train(args):
+    if 'LOCAL_RANK' in os.environ:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
 
     ## DDP init
     dist.init_process_group(backend='nccl',init_method='env://',timeout=datetime.timedelta(seconds=36000))
@@ -62,13 +66,17 @@ def train(args):
         writer = SummaryWriter(os.path.join(args.logdir,args.experiment_name,'runs'),args.experiment_name)
 
     ### Setup Dataloader
-    datasets_setting = [
-        {'task':'deblurring','ratio':1,'im_path':'/home/jiaxin/Training_Data/DocRes_data/train/deblurring/','json_paths':['/home/jiaxin/Training_Data/DocRes_data/train/deblurring/tdd/train.json']},
-        {'task':'dewarping','ratio':1,'im_path':'/home/jiaxin/Training_Data/DocRes_data/train/dewarping/','json_paths':['/home/jiaxin/Training_Data/DocRes_data/train/dewarping/doc3d/train_1_19.json']},
-        {'task':'binarization','ratio':1,'im_path':'/home/jiaxin/Training_Data/DocRes_data/train/binarization/','json_paths':['/home/jiaxin/Training_Data/DocRes_data/train/binarization/train.json']},
-        {'task':'deshadowing','ratio':1,'im_path':'/home/jiaxin/Training_Data/DocRes_data/train/deshadowing/','json_paths':['/home/jiaxin/Training_Data/DocRes_data/train/deshadowing/train.json']},
-        {'task':'appearance','ratio':1,'im_path':'/home/jiaxin/Training_Data/DocRes_data/train/appearance/','json_paths':['/home/jiaxin/Training_Data/DocRes_data/train/appearance/trainv2.json']}
+    all_datasets_setting = [
+        {'task':'deblurring','ratio':1,'im_path':'/home/cl/workspace/dataset/deblurring/','json_paths':['/home/cl/workspace/dataset/deblurring/train.json']},
+        {'task':'dewarping','ratio':1,'im_path':'/home/cl/workspace/dataset/dewarp/doc3d/data/raw/','json_paths':['/home/cl/workspace/dataset/dewarp/doc3d/train.json']},
+        {'task':'binarization','ratio':1,'im_path':'/home/cl/workspace/dataset/binarization/','json_paths':['/home/cl/workspace/dataset/binarization/train.json']},
+        {'task':'deshadowing','ratio':1,'im_path':'/home/cl/workspace/dataset/deshadowing/','json_paths':['/home/cl/workspace/dataset/deshadowing/train.json']},
+        {'task':'appearance','ratio':1,'im_path':'/home/cl/workspace/dataset/appearance/','json_paths':['/home/cl/workspace/dataset/appearance/train.json']}
         ]
+    if args.train_stage == 'dewarp_pretrain':
+        datasets_setting = [x for x in all_datasets_setting if x['task'] == 'dewarping']
+    else:
+        datasets_setting = all_datasets_setting
 
 
     ratios = [dataset_setting['ratio'] for dataset_setting in datasets_setting]
@@ -104,19 +112,28 @@ def train(args):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.total_iter, eta_min=1e-6, last_epoch=-1)
 
     ### load checkpoint
-    iter_start=0
-    if args.resume is not None:                                         
+    iter_start = 0
+    if args.resume is not None:
         print("Loading model and optimizer from checkpoint '{}'".format(args.resume))
-        x = checkpoint['model_state']
-        model.load_state_dict(x,strict=False)
-        iter_start=checkpoint['iter']
+        checkpoint = torch.load(args.resume, map_location='cpu')
+
+        model_state = checkpoint.get('model_state', checkpoint)
+        model.load_state_dict(model_state, strict=False)
+
+        if 'optimizer_state' not in checkpoint:
+            raise KeyError(
+                "Checkpoint '{}' missing required key 'optimizer_state'".format(args.resume)
+            )
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
+
+        iter_start = checkpoint.get('iters', checkpoint.get('iter', 0))
         print("Loaded checkpoint '{}' (iter {})".format(args.resume, iter_start))
 
     ###-----------------------------------------Training-----------------------------------------
     ##initialize
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     loss_dict = {}
-    total_step = 0
+    total_step = iter_start
     l2 = nn.MSELoss()
     l1 = nn.L1Loss()
     ce = nn.CrossEntropyLoss()
@@ -139,7 +156,7 @@ def train(args):
         gt_im = gt_im.float().cuda()
 
         binarization_loss,appearance_loss,dewarping_loss,deblurring_loss,deshadowing_loss = 0,0,0,0,0
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             pred_im = model(in_im,trainloaders[loader_index]['task']['task'])
             if trainloaders[loader_index]['task']['task'] == 'binarization':
                 gt_im = gt_im.long()
@@ -157,6 +174,54 @@ def train(args):
             elif trainloaders[loader_index]['task']['task'] == 'deshadowing':
                 deshadowing_loss = l1(pred_im, gt_im)
                 loss = deshadowing_loss
+
+        # TensorBoard image visualization for sampled task.
+        if args.tboard and (iters + 1) % args.vis_interval == 0:
+            task_name = trainloaders[loader_index]['task']['task']
+            input_vis = torch.clamp(in_im[:, :3, :, :], 0, 1)
+            prompt_vis = torch.clamp(in_im[:, 3:6, :, :], 0, 1)
+            writer.add_images(f'Vis/{task_name}/input', input_vis[:2], total_step)
+            writer.add_images(f'Vis/{task_name}/prompt', prompt_vis[:2], total_step)
+
+            if task_name == 'binarization':
+                pred_cls = torch.max(torch.softmax(pred_im[:, :2, :, :], 1), 1)[1].unsqueeze(1).float()
+                gt_cls = gt_im[:, 0:1, :, :].float()
+                pred_vis = pred_cls.repeat(1, 3, 1, 1)
+                gt_vis = gt_cls.repeat(1, 3, 1, 1)
+            elif task_name == 'dewarping':
+                pred_flow = pred_im[:, :2, :, :]
+                gt_flow = gt_im[:, :2, :, :]
+                pred_mag = torch.norm(pred_flow, dim=1, keepdim=True)
+                gt_mag = torch.norm(gt_flow, dim=1, keepdim=True)
+                pred_vis = pred_mag / (pred_mag.max() + 1e-6)
+                gt_vis = gt_mag / (gt_mag.max() + 1e-6)
+                pred_vis = pred_vis.repeat(1, 3, 1, 1)
+                gt_vis = gt_vis.repeat(1, 3, 1, 1)
+                writer.add_images(f'Vis/{task_name}/mask', gt_im[:, 2:3, :, :].repeat(1, 3, 1, 1)[:2], total_step)
+
+                # Human-readable dewarping preview: apply predicted/gt map to input image.
+                bsz, _, h, w = pred_flow.shape
+                base_x = torch.arange(w, device=pred_flow.device, dtype=pred_flow.dtype).view(1, 1, w).expand(bsz, h, w)
+                base_y = torch.arange(h, device=pred_flow.device, dtype=pred_flow.dtype).view(1, h, 1).expand(bsz, h, w)
+                base_coord = torch.stack((base_x / float(w), base_y / float(h)), dim=1)
+
+                pred_map = pred_flow + base_coord
+                gt_map = gt_flow + base_coord
+                pred_grid = (pred_map.permute(0, 2, 3, 1) * 2.0) - 1.0
+                gt_grid = (gt_map.permute(0, 2, 3, 1) * 2.0) - 1.0
+                pred_grid = pred_grid.to(input_vis.dtype)
+                gt_grid = gt_grid.to(input_vis.dtype)
+
+                pred_rectified = F.grid_sample(input_vis, pred_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+                gt_rectified = F.grid_sample(input_vis, gt_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+                writer.add_images(f'Vis/{task_name}/pred_rectified', torch.clamp(pred_rectified[:2], 0, 1), total_step)
+                writer.add_images(f'Vis/{task_name}/gt_rectified', torch.clamp(gt_rectified[:2], 0, 1), total_step)
+            else:
+                pred_vis = torch.clamp(pred_im, 0, 1)
+                gt_vis = torch.clamp(gt_im, 0, 1)
+
+            writer.add_images(f'Vis/{task_name}/pred', pred_vis[:2], total_step)
+            writer.add_images(f'Vis/{task_name}/gt', gt_vis[:2], total_step)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -193,6 +258,7 @@ def train(args):
                 torch.save(state, os.path.join(args.logdir,args.experiment_name,"{}.pkl".format(iters+1)))
 
         sched.step()
+        total_step += 1
 
 
 
@@ -212,9 +278,15 @@ if __name__ == '__main__':
                         help='Path to store the loss logs')
     parser.add_argument('--tboard', dest='tboard', action='store_true', 
                         help='Enable visualization(s) on tensorboard | False by default')
-    parser.add_argument('--local_rank',type=int,default=0,metavar='N')    
+    parser.add_argument('--local_rank',type=int,default=0,metavar='N')
+    parser.add_argument('--local-rank', dest='local_rank', type=int)    
     parser.add_argument('--experiment_name', nargs='?', type=str,default='experiment_name',
                         help='the name of this experiment')
+    parser.add_argument('--vis_interval', nargs='?', type=int, default=200,
+                        help='Iterations interval for tensorboard image visualization')
+    parser.add_argument('--train_stage', nargs='?', type=str, default='multitask',
+                        choices=['multitask', 'dewarp_pretrain'],
+                        help='Training stage selector')
     parser.set_defaults(tboard=False)
     args = parser.parse_args()
 

@@ -2,7 +2,6 @@ import os
 from os.path import join as pjoin
 import collections
 import json
-from numpy.lib.histograms import histogram_bin_edges
 import torch
 import numpy as np
 import cv2
@@ -24,8 +23,8 @@ class DocResTrainDataset(data.Dataset):
                 data = json.load(f)
                 self.datas += data
 
-        self.background_paths = glob.glob('/data2/jiaxin/Training_Data/dewarping/doc_3d/background/*/*/*')
-        self.shadow_paths = glob.glob('/data2/jiaxin/Training_Data/illumination/doc3dshadow/new_shadow/*/*')
+        self.background_paths = glob.glob('/home/cl/workspace/dataset/dewarp/backgrounds/dtd/images/*/*.jpg')
+        self.shadow_paths = glob.glob('/home/cl/workspace/dataset/appearance/shadows/*/*')
 
     def __len__(self):
         return len(self.datas)
@@ -52,18 +51,19 @@ class DocResTrainDataset(data.Dataset):
             ## image prepare
             in_im = cv2.imread(os.path.join(self.im_path,data['in_path']))
             mask = cv2.imread(os.path.join(self.im_path,data['mask_path']))[:,:,0]
-            bm = np.load(os.path.join(self.im_path,data['gt_path'])).astype(np.float)  #-> 0-448
+            bm = np.load(os.path.join(self.im_path,data['gt_path'])).astype(np.float32)  #-> 0-448
             bm = cv2.resize(bm,(448,448))
-            ## add background 
-            background = cv2.imread(random.choice(self.background_paths))
-            min_length = min(background.shape[:2])
-            crop_size = random.randint(int(min_length*0.5),min_length-1)
-            shift_y = np.random.randint(0,background.shape[1]-crop_size)
-            shift_x = np.random.randint(0,background.shape[0]-crop_size)
-            background = background[shift_x:shift_x+crop_size,shift_y:shift_y+crop_size,:]
-            background = cv2.resize(background,(448,448))
-            if np.mean(in_im[mask==0])<10:
-                in_im[mask==0]=background[mask==0]
+            ## add background when background assets are available
+            if len(self.background_paths) > 0:
+                background = cv2.imread(random.choice(self.background_paths))
+                min_length = min(background.shape[:2])
+                crop_size = random.randint(int(min_length*0.5),min_length-1)
+                shift_y = np.random.randint(0,background.shape[1]-crop_size)
+                shift_x = np.random.randint(0,background.shape[0]-crop_size)
+                background = background[shift_x:shift_x+crop_size,shift_y:shift_y+crop_size,:]
+                background = cv2.resize(background,(448,448))
+                if np.mean(in_im[mask==0])<10:
+                    in_im[mask==0]=background[mask==0]
             ## random crop and get prompt
             in_im,mask,bm = self.random_margin_bm(in_im,mask,bm) # bm-> 0-1
             in_im = cv2.resize(in_im,(self.size,self.size))
@@ -119,7 +119,7 @@ class DocResTrainDataset(data.Dataset):
             thr  = self.rgbim_transform(thr)
             gradient  = self.rgbim_transform(gradient)
             bin_map  = self.rgbim_transform(bin_map)
-            gt_im = gt_im.astype(np.float)/255. 
+            gt_im = gt_im.astype(np.float32)/255. 
             gt_im = torch.from_numpy(gt_im)
             gt_im = gt_im.unsqueeze(0)
             dtsprompt = torch.cat((thr[0].unsqueeze(0),gradient[0].unsqueeze(0),bin_map[0].unsqueeze(0)),0)
@@ -228,7 +228,7 @@ class DocResTrainDataset(data.Dataset):
 
 
     def rgbim_transform(self,im):
-        im = im.astype(np.float)/255. 
+        im = im.astype(np.float32)/255. 
         im = im.transpose(2, 0, 1)
         im = torch.from_numpy(im)
         return im
