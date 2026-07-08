@@ -114,20 +114,24 @@ def train(args):
     ### load checkpoint
     iter_start = 0
     if args.resume is not None:
-        print("Loading model and optimizer from checkpoint '{}'".format(args.resume))
+        print("Loading checkpoint '{}'".format(args.resume))
         checkpoint = torch.load(args.resume, map_location='cpu')
 
         model_state = checkpoint.get('model_state', checkpoint)
         model.load_state_dict(model_state, strict=False)
 
-        if 'optimizer_state' not in checkpoint:
-            raise KeyError(
-                "Checkpoint '{}' missing required key 'optimizer_state'".format(args.resume)
-            )
-        optimizer.load_state_dict(checkpoint['optimizer_state'])
+        if args.resume_model_only:
+            iter_start = 0
+            print("Loaded model weights only; optimizer and scheduler are re-initialized.")
+        else:
+            if 'optimizer_state' not in checkpoint:
+                raise KeyError(
+                    "Checkpoint '{}' missing required key 'optimizer_state'".format(args.resume)
+                )
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
 
-        iter_start = checkpoint.get('iters', checkpoint.get('iter', 0))
-        print("Loaded checkpoint '{}' (iter {})".format(args.resume, iter_start))
+            iter_start = checkpoint.get('iters', checkpoint.get('iter', 0))
+            print("Loaded checkpoint '{}' (iter {})".format(args.resume, iter_start))
 
     ###-----------------------------------------Training-----------------------------------------
     ##initialize
@@ -274,6 +278,8 @@ if __name__ == '__main__':
                         help='Learning Rate')
     parser.add_argument('--resume', nargs='?', type=str, default=None,    
                         help='Path to previous saved model to restart from')
+    parser.add_argument('--resume_model_only', action='store_true',
+                        help='Only load model weights when resuming')
     parser.add_argument('--logdir', nargs='?', type=str, default='./checkpoints/',    
                         help='Path to store the loss logs')
     parser.add_argument('--tboard', dest='tboard', action='store_true', 
