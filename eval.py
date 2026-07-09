@@ -273,10 +273,10 @@ def model_init(args):
         inp_channels=6, 
         out_channels=3, 
         dim = 48,
-        num_blocks = [2,3,3,4],     
-        num_refinement_blocks = 4,
+        num_blocks = [1,2,2,3],     
+        num_refinement_blocks = 1,
         heads = [1,2,4,8],
-        ffn_expansion_factor = 2.66,
+        ffn_expansion_factor = 2.0,
         bias = False,
         LayerNorm_type = 'WithBias',   
         dual_pixel_task = True       

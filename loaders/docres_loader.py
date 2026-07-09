@@ -274,7 +274,7 @@ class DocResTrainDataset(data.Dataset):
                 mask = cv2.resize(mask,(64,64))
             else:
                 mask = cv2.resize(mask,(128,128))
-            mask = cv2.resize(mask,(256,256))
+            mask = cv2.resize(mask,(self.size,self.size))
         mask[mask>155] = 255
         mask[mask<=155] = 0
         return mask

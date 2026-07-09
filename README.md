@@ -51,9 +51,13 @@ python eval.py --dataset realdae
 ## Training 
 1. Dataset preparation, see [dataset instruction](./data/README.md)
 2. Specify the datasets_setting within `train.py` based on your dataset path and experimental setting.
-3. Run the following script
+3. Run Stage 1 dewarping pre-training (default: 100k iters)
 ```bash
-bash start_train.sh
+bash train_stage1_dewarp.sh
+```
+4. Run Stage 2 multitask training from Stage 1 checkpoint (default: `./checkpoints/docres_stage1_dewarp_100k/100000.pkl`)
+```bash
+bash train_stage2_multitask.sh
 ```
 
 

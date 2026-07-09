@@ -5,3 +5,5 @@ checkpoints/
 runs/
 .vscode
 data/MBD/checkpoint/
+input/test
+output/
