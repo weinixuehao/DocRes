@@ -5,9 +5,7 @@ import glob
 import random 
 import argparse
 import numpy as np
-from tqdm import tqdm
-from piq import ssim,psnr
-from itertools import cycle
+from piq import MultiScaleSSIMLoss
 
 import torch
 import torch.nn as nn
@@ -16,7 +14,7 @@ from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 
 
-from utils import dict2string,mkdir,get_lr,torch2cvimg,second2hours
+from utils import dict2string, mkdir, get_lr, second2hours
 from loaders import docres_loader
 from models import restormer_arch
 from inference import dewarp_prompt, deshadow_prompt, appearance_prompt, deblur_prompt
@@ -68,6 +66,67 @@ def _build_trainloaders(datasets_setting, args):
 
 def _train_stage_for_iter(iter_idx, stage1_iter):
     return 'dewarp_pretrain' if iter_idx < stage1_iter else 'multitask'
+
+
+def _flow_to_grid(flow):
+    bsz, _, h, w = flow.shape
+    base_x = torch.arange(w, device=flow.device, dtype=flow.dtype).view(1, 1, w).expand(bsz, h, w)
+    base_y = torch.arange(h, device=flow.device, dtype=flow.dtype).view(1, h, 1).expand(bsz, h, w)
+    base_coord = torch.stack((base_x / float(w), base_y / float(h)), dim=1)
+    warp_map = flow + base_coord
+    return (warp_map.permute(0, 2, 3, 1) * 2.0) - 1.0
+
+
+def _sample_by_grid(image, grid, mode='bilinear'):
+    return F.grid_sample(
+        image,
+        grid.to(image.dtype),
+        mode=mode,
+        padding_mode='zeros',
+        align_corners=False,
+    )
+
+
+def _mask_edge_loss(pred_mask, gt_mask):
+    pred_dx = pred_mask[:, :, :, 1:] - pred_mask[:, :, :, :-1]
+    pred_dy = pred_mask[:, :, 1:, :] - pred_mask[:, :, :-1, :]
+    gt_dx = gt_mask[:, :, :, 1:] - gt_mask[:, :, :, :-1]
+    gt_dy = gt_mask[:, :, 1:, :] - gt_mask[:, :, :-1, :]
+
+    grad_loss = F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
+
+    pred_dx_crop = pred_dx[:, :, :-1, :]
+    pred_dy_crop = pred_dy[:, :, :, :-1]
+    edge_mask = (pred_dx_crop.abs() + pred_dy_crop.abs()) > 1e-3
+    rectilinear_loss = (
+        pred_dx_crop.abs() * pred_dy_crop.abs() * edge_mask.float()
+    ).sum() / edge_mask.float().sum().clamp(min=1.0)
+    return grad_loss + rectilinear_loss
+
+
+def _compute_dewarping_loss(pred_flow, gt_flow, input_rgb, mask, l1_fn, ms_ssim_fn, weights):
+    l1_loss = l1_fn(pred_flow, gt_flow)
+
+    pred_grid = _flow_to_grid(pred_flow)
+    with torch.no_grad():
+        gt_grid = _flow_to_grid(gt_flow)
+
+    pred_rect = _sample_by_grid(input_rgb, pred_grid, mode='bilinear')
+    with torch.no_grad():
+        gt_rect = _sample_by_grid(input_rgb, gt_grid, mode='bilinear')
+    ms_ssim_loss = ms_ssim_fn(pred_rect, gt_rect)
+
+    pred_mask = _sample_by_grid(mask, pred_grid, mode='nearest')
+    with torch.no_grad():
+        gt_mask = _sample_by_grid(mask, gt_grid, mode='nearest')
+    edge_loss = _mask_edge_loss(pred_mask, gt_mask)
+
+    total_loss = (
+        weights['l1'] * l1_loss
+        + weights['ms_ssim'] * ms_ssim_loss
+        + weights['edge'] * edge_loss
+    )
+    return total_loss, l1_loss, ms_ssim_loss, edge_loss
 
 
 def _is_image_file(path):
@@ -261,13 +320,6 @@ def train(args):
     trainloaders_dewarp, ratios_dewarp = _build_trainloaders(dewarp_datasets_setting, args)
     trainloaders_all, ratios_all = _build_trainloaders(all_datasets_setting, args)
 
-
-    ### test loader
-    # for i in tqdm(range(args.total_iter)):
-    #     loader_index = random.choices(list(range(len(trainloaders))),ratios)[0]
-    #     in_im,gt_im = next(trainloaders[loader_index]['iter_loader'])
-
-
     ### Setup Model
     model = restormer_arch.Restormer( 
         inp_channels=6, 
@@ -310,6 +362,12 @@ def train(args):
     total_step = iter_start
     l1 = nn.L1Loss()
     ce = nn.CrossEntropyLoss()
+    ms_ssim_loss = MultiScaleSSIMLoss(data_range=1.0, reduction='mean').to(device)
+    dewarp_loss_weights = {
+        'l1': args.dewarp_l1_weight,
+        'ms_ssim': args.dewarp_ms_ssim_weight,
+        'edge': args.dewarp_edge_weight,
+    }
 
     ## total_steps
     last_stage_name = None
@@ -337,6 +395,8 @@ def train(args):
         gt_im = gt_im.float().cuda()
 
         binarization_loss,appearance_loss,dewarping_loss,deblurring_loss,deshadowing_loss = 0,0,0,0,0
+        dewarp_l1_loss,dewarp_ms_loss,dewarp_edge_loss = 0,0,0
+        loss = None
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             task_name = active_trainloaders[loader_index]['task']['task']
             pred_im = model(in_im,task_name)
@@ -344,9 +404,6 @@ def train(args):
                 gt_im = gt_im.long()
                 binarization_loss = ce(pred_im[:,:2,:,:], gt_im[:,0,:,:])
                 loss = binarization_loss
-            elif task_name == 'dewarping':
-                dewarping_loss = l1(pred_im[:,:2,:,:], gt_im[:,:2,:,:])
-                loss = dewarping_loss
             elif task_name == 'appearance':
                 appearance_loss = l1(pred_im, gt_im)
                 loss = appearance_loss
@@ -356,6 +413,26 @@ def train(args):
             elif task_name == 'deshadowing':
                 deshadowing_loss = l1(pred_im, gt_im)
                 loss = deshadowing_loss
+
+        if task_name == 'dewarping':
+            with torch.amp.autocast('cuda', enabled=False):
+                pred_flow = pred_im[:, :2, :, :].float()
+                gt_flow = gt_im[:, :2, :, :].float()
+                input_rgb = torch.clamp(in_im[:, :3, :, :].float(), 0, 1)
+                mask = gt_im[:, 2:3, :, :].float()
+                dewarping_loss, dewarp_l1_loss, dewarp_ms_loss, dewarp_edge_loss = _compute_dewarping_loss(
+                    pred_flow,
+                    gt_flow,
+                    input_rgb,
+                    mask,
+                    l1,
+                    ms_ssim_loss,
+                    dewarp_loss_weights,
+                )
+                loss = dewarping_loss
+
+        if loss is None:
+            raise ValueError(f"Unsupported training task: {task_name}")
 
         # TensorBoard image visualization for sampled task.
         if args.tboard and (iters + 1) % args.vis_interval == 0:
@@ -370,8 +447,8 @@ def train(args):
                 pred_vis = pred_cls.repeat(1, 3, 1, 1)
                 gt_vis = gt_cls.repeat(1, 3, 1, 1)
             elif task_name == 'dewarping':
-                pred_flow = pred_im[:, :2, :, :]
-                gt_flow = gt_im[:, :2, :, :]
+                pred_flow = pred_im[:, :2, :, :].float()
+                gt_flow = gt_im[:, :2, :, :].float()
                 pred_mag = torch.norm(pred_flow, dim=1, keepdim=True)
                 gt_mag = torch.norm(gt_flow, dim=1, keepdim=True)
                 pred_vis = pred_mag / (pred_mag.max() + 1e-6)
@@ -380,21 +457,9 @@ def train(args):
                 gt_vis = gt_vis.repeat(1, 3, 1, 1)
                 writer.add_images(f'Vis/{task_name}/mask', gt_im[:, 2:3, :, :].repeat(1, 3, 1, 1)[:2], total_step)
 
-                # Human-readable dewarping preview: apply predicted/gt map to input image.
-                bsz, _, h, w = pred_flow.shape
-                base_x = torch.arange(w, device=pred_flow.device, dtype=pred_flow.dtype).view(1, 1, w).expand(bsz, h, w)
-                base_y = torch.arange(h, device=pred_flow.device, dtype=pred_flow.dtype).view(1, h, 1).expand(bsz, h, w)
-                base_coord = torch.stack((base_x / float(w), base_y / float(h)), dim=1)
-
-                pred_map = pred_flow + base_coord
-                gt_map = gt_flow + base_coord
-                pred_grid = (pred_map.permute(0, 2, 3, 1) * 2.0) - 1.0
-                gt_grid = (gt_map.permute(0, 2, 3, 1) * 2.0) - 1.0
-                pred_grid = pred_grid.to(input_vis.dtype)
-                gt_grid = gt_grid.to(input_vis.dtype)
-
-                pred_rectified = F.grid_sample(input_vis, pred_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-                gt_rectified = F.grid_sample(input_vis, gt_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+                pred_rectified = _sample_by_grid(input_vis.float(), _flow_to_grid(pred_flow), mode='bilinear')
+                with torch.no_grad():
+                    gt_rectified = _sample_by_grid(input_vis.float(), _flow_to_grid(gt_flow), mode='bilinear')
                 writer.add_images(f'Vis/{task_name}/pred_rectified', torch.clamp(pred_rectified[:2], 0, 1), total_step)
                 writer.add_images(f'Vis/{task_name}/gt_rectified', torch.clamp(gt_rectified[:2], 0, 1), total_step)
             else:
@@ -410,6 +475,9 @@ def train(args):
         sched.step()
     
         loss_dict['dew_loss']=dewarping_loss.item() if isinstance(dewarping_loss,torch.Tensor) else 0
+        loss_dict['dew_l1_loss']=dewarp_l1_loss.item() if isinstance(dewarp_l1_loss,torch.Tensor) else 0
+        loss_dict['dew_ms_loss']=dewarp_ms_loss.item() if isinstance(dewarp_ms_loss,torch.Tensor) else 0
+        loss_dict['dew_edge_loss']=dewarp_edge_loss.item() if isinstance(dewarp_edge_loss,torch.Tensor) else 0
         loss_dict['app_loss']=appearance_loss.item() if isinstance(appearance_loss,torch.Tensor) else 0
         loss_dict['des_loss']=deshadowing_loss.item() if isinstance(deshadowing_loss,torch.Tensor) else 0
         loss_dict['deb_loss']=deblurring_loss.item() if isinstance(deblurring_loss,torch.Tensor) else 0
@@ -474,6 +542,12 @@ if __name__ == '__main__':
                         help='Iterations interval for tensorboard image visualization')
     parser.add_argument('--stage1_iter', nargs='?', type=int, default=100000,
                         help='Train dewarping only before this iteration')
+    parser.add_argument('--dewarp_l1_weight', nargs='?', type=float, default=1.0,
+                        help='Weight for dewarping L1 flow loss')
+    parser.add_argument('--dewarp_ms_ssim_weight', nargs='?', type=float, default=0.15,
+                        help='Weight for dewarping MS-SSIM loss on warped image')
+    parser.add_argument('--dewarp_edge_weight', nargs='?', type=float, default=0.08,
+                        help='Weight for dewarping mask edge alignment loss')
     parser.set_defaults(tboard=False)
     args = parser.parse_args()
 
