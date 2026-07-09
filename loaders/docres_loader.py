@@ -2,6 +2,7 @@ import os
 from os.path import join as pjoin
 import collections
 import json
+import argparse
 import torch
 import numpy as np
 import cv2
@@ -556,3 +557,77 @@ class DocResTrainDataset(data.Dataset):
             in_img = cv2.imdecode(encimg,1).astype(np.uint8)
 
         return in_img
+
+
+def _tensor_to_bgr_uint8(tensor_chw):
+    arr = tensor_chw.detach().cpu().numpy().transpose(1, 2, 0)
+    arr = np.clip(arr, 0.0, 1.0)
+    arr = (arr * 255.0).astype(np.uint8)
+    return arr
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Debug DocResTrainDataset sample')
+    parser.add_argument('--task', type=str, default='dewarping',
+                        choices=['deblurring', 'dewarping', 'binarization', 'deshadowing', 'appearance'])
+    parser.add_argument('--index', type=int, default=0, help='Dataset sample index')
+    parser.add_argument('--img_size', type=int, default=512, help='Dataset image size')
+    parser.add_argument('--save_dir', type=str, default='./output/debug_loader', help='Debug image output dir')
+    args = parser.parse_args()
+
+    dataset_settings = {
+        'deblurring': {
+            'task': 'deblurring',
+            'ratio': 1,
+            'im_path': '/home/cl/workspace/dataset/deblurring/',
+            'json_paths': ['/home/cl/workspace/dataset/deblurring/train.json'],
+        },
+        'dewarping': {
+            'task': 'dewarping',
+            'ratio': 1,
+            'im_path': '/home/cl/workspace/dataset/dewarp/doc3d/data/raw/',
+            'json_paths': ['/home/cl/workspace/dataset/dewarp/doc3d/train.json'],
+        },
+        'binarization': {
+            'task': 'binarization',
+            'ratio': 1,
+            'im_path': '/home/cl/workspace/dataset/binarization/',
+            'json_paths': ['/home/cl/workspace/dataset/binarization/train.json'],
+        },
+        'deshadowing': {
+            'task': 'deshadowing',
+            'ratio': 1,
+            'im_path': '/home/cl/workspace/dataset/deshadowing/',
+            'json_paths': ['/home/cl/workspace/dataset/deshadowing/train.json'],
+        },
+        'appearance': {
+            'task': 'appearance',
+            'ratio': 1,
+            'im_path': '/home/cl/workspace/dataset/appearance/',
+            'json_paths': ['/home/cl/workspace/dataset/appearance/train.json'],
+        },
+    }
+
+    dataset = DocResTrainDataset(dataset=dataset_settings[args.task], img_size=args.img_size)
+    if len(dataset) == 0:
+        raise ValueError('Empty dataset')
+    idx = args.index % len(dataset)
+    in_tensor, gt_tensor = dataset[idx]
+
+    print('task:', args.task)
+    print('dataset length:', len(dataset))
+    print('index:', idx)
+    print('in_tensor shape:', tuple(in_tensor.shape), 'dtype:', in_tensor.dtype,
+          'min:', float(in_tensor.min()), 'max:', float(in_tensor.max()))
+    print('gt_tensor shape:', tuple(gt_tensor.shape), 'dtype:', gt_tensor.dtype,
+          'min:', float(gt_tensor.min()), 'max:', float(gt_tensor.max()))
+    if args.task == 'dewarping':
+        print('dewarp backgrounds found:', len(dataset.background_paths))
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    input_bgr = _tensor_to_bgr_uint8(in_tensor[:3])
+    prompt_bgr = _tensor_to_bgr_uint8(in_tensor[3:6])
+    cv2.imwrite(os.path.join(args.save_dir, f'{args.task}_input.png'), input_bgr)
+    cv2.imwrite(os.path.join(args.save_dir, f'{args.task}_prompt.png'), prompt_bgr)
+    print('saved:', os.path.join(args.save_dir, f'{args.task}_input.png'))
+    print('saved:', os.path.join(args.save_dir, f'{args.task}_prompt.png'))

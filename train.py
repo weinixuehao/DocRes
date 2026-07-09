@@ -52,7 +52,7 @@ def _build_trainloaders(datasets_setting, args):
             dataset=datasets[i],
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=args.num_workers,
             pin_memory=True,
             drop_last=True,
         )
@@ -458,6 +458,8 @@ if __name__ == '__main__':
                         help='# of the epochs')
     parser.add_argument('--batch_size', nargs='?', type=int, default=10, 
                         help='Batch Size')
+    parser.add_argument('--num_workers', nargs='?', type=int, default=2,
+                        help='Dataloader workers')
     parser.add_argument('--l_rate', nargs='?', type=float, default=2e-4, 
                         help='Learning Rate')
     parser.add_argument('--resume', nargs='?', type=str, default=None,    
