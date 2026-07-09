@@ -101,7 +101,7 @@ def _predict_uint8_image(model, model_input, task_name):
 
 
 def _infer_dewarp_stage(model, device, image_bgr, return_mask=False):
-    input_size = 256
+    input_size = 384
     im_org = image_bgr
     im_masked, prompt_org = dewarp_prompt(im_org.copy())
     h, w = im_masked.shape[:2]
@@ -452,7 +452,7 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Hyperparams')
-    parser.add_argument('--im_size', nargs='?', type=int, default=512, 
+    parser.add_argument('--im_size', nargs='?', type=int, default=384, 
                         help='Height of the input image')
     parser.add_argument('--total_iter', nargs='?', type=int, default=350000, 
                         help='# of the epochs')

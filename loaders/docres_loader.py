@@ -12,7 +12,7 @@ from torch.utils import data
 import glob
 
 class DocResTrainDataset(data.Dataset):
-    def __init__(self, dataset={}, img_size=512,):
+    def __init__(self, dataset={}, img_size=384,):
         json_paths = dataset['json_paths']
         self.task = dataset['task']
         self.size = img_size
@@ -130,9 +130,9 @@ class DocResTrainDataset(data.Dataset):
             gt_im = cv2.imread(os.path.join(self.im_path,data['gt_path']))
             shadow_im = self.deshadow_dtsprompt(in_im)   
             if 'fsdsrd' in data['in_path']:
-                in_im = cv2.resize(in_im,(512,512))
-                gt_im = cv2.resize(gt_im,(512,512))
-                shadow_im = cv2.resize(shadow_im,(512,512))
+                in_im = cv2.resize(in_im,(self.size,self.size))
+                gt_im = cv2.resize(gt_im,(self.size,self.size))
+                shadow_im = cv2.resize(shadow_im,(self.size,self.size))
                 in_im, gt_im,shadow_im = self.randomcrop([in_im,gt_im,shadow_im])
             else:
                 in_im, gt_im,shadow_im = self.randomcrop([in_im,gt_im,shadow_im])
@@ -571,7 +571,7 @@ if __name__ == '__main__':
     parser.add_argument('--task', type=str, default='dewarping',
                         choices=['deblurring', 'dewarping', 'binarization', 'deshadowing', 'appearance'])
     parser.add_argument('--index', type=int, default=0, help='Dataset sample index')
-    parser.add_argument('--img_size', type=int, default=512, help='Dataset image size')
+    parser.add_argument('--img_size', type=int, default=384, help='Dataset image size')
     parser.add_argument('--save_dir', type=str, default='./output/debug_loader', help='Debug image output dir')
     args = parser.parse_args()
 

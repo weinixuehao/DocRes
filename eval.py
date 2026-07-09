@@ -19,9 +19,9 @@ from data.MBD.infer import net1_net2_infer_single_im
 
 def dewarp_prompt(img):
     mask = net1_net2_infer_single_im(img,'data/MBD/checkpoint/mbd.pkl')
-    base_coord = utils.getBasecoord(256,256)/256
+    base_coord = utils.getBasecoord(384,384)/384
     img[mask==0]=0
-    mask = cv2.resize(mask,(256,256))/255
+    mask = cv2.resize(mask,(384,384))/255
     return img,np.concatenate((base_coord,np.expand_dims(mask,-1)),-1)
 
 def deshadow_prompt(img):
@@ -95,7 +95,7 @@ def binarization_promptv2(img):
     return np.concatenate((np.expand_dims(thresh,-1),np.expand_dims(high_frequency,-1),np.expand_dims(result,-1)),-1)
 
 def dewarping(model,im_path):
-    INPUT_SIZE=256
+    INPUT_SIZE=384
     im_org = cv2.imread(im_path)
     im_masked, prompt_org = dewarp_prompt(im_org.copy())
 
