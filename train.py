@@ -5,7 +5,7 @@ import glob
 import random 
 import argparse
 import numpy as np
-from piq import MultiScaleSSIMLoss
+from piq import MultiScaleSSIMLoss, SSIMLoss, DISTS
 
 import torch
 import torch.nn as nn
@@ -127,6 +127,22 @@ def _compute_dewarping_loss(pred_flow, gt_flow, input_rgb, mask, l1_fn, ms_ssim_
         + weights['edge'] * edge_loss
     )
     return total_loss, l1_loss, ms_ssim_loss, edge_loss
+
+
+def _compute_deshadowing_loss(pred_rgb, gt_rgb, l1_fn, ssim_fn, dists_fn, weights):
+    pred_rgb = torch.clamp(pred_rgb, 0, 1)
+    gt_rgb = torch.clamp(gt_rgb, 0, 1)
+
+    l1_loss = l1_fn(pred_rgb, gt_rgb)
+    ssim_loss = ssim_fn(pred_rgb, gt_rgb)
+    dists_loss = dists_fn(pred_rgb, gt_rgb)
+
+    total_loss = (
+        weights['l1'] * l1_loss
+        + weights['ssim'] * ssim_loss
+        + weights['dists'] * dists_loss
+    )
+    return total_loss, l1_loss, ssim_loss, dists_loss
 
 
 def _is_image_file(path):
@@ -363,10 +379,17 @@ def train(args):
     l1 = nn.L1Loss()
     ce = nn.CrossEntropyLoss()
     ms_ssim_loss = MultiScaleSSIMLoss(data_range=1.0, reduction='mean').to(device)
+    ssim_loss_fn = SSIMLoss(data_range=1.0, reduction='mean').to(device)
+    dists_loss_fn = DISTS(reduction='mean').to(device)
     dewarp_loss_weights = {
         'l1': args.dewarp_l1_weight,
         'ms_ssim': args.dewarp_ms_ssim_weight,
         'edge': args.dewarp_edge_weight,
+    }
+    deshadow_loss_weights = {
+        'l1': args.deshadow_l1_weight,
+        'ssim': args.deshadow_ssim_weight,
+        'dists': args.deshadow_dists_weight,
     }
 
     ## total_steps
@@ -396,6 +419,7 @@ def train(args):
 
         binarization_loss,appearance_loss,dewarping_loss,deblurring_loss,deshadowing_loss = 0,0,0,0,0
         dewarp_l1_loss,dewarp_ms_loss,dewarp_edge_loss = 0,0,0
+        deshadow_l1_loss,deshadow_ssim_loss,deshadow_dists_loss = 0,0,0
         loss = None
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             task_name = active_trainloaders[loader_index]['task']['task']
@@ -410,9 +434,6 @@ def train(args):
             elif task_name == 'deblurring':
                 deblurring_loss = l1(pred_im, gt_im)
                 loss = deblurring_loss
-            elif task_name == 'deshadowing':
-                deshadowing_loss = l1(pred_im, gt_im)
-                loss = deshadowing_loss
 
         if task_name == 'dewarping':
             with torch.amp.autocast('cuda', enabled=False):
@@ -430,6 +451,20 @@ def train(args):
                     dewarp_loss_weights,
                 )
                 loss = dewarping_loss
+
+        if task_name == 'deshadowing':
+            with torch.amp.autocast('cuda', enabled=False):
+                pred_rgb = torch.clamp(pred_im.float(), 0, 1)
+                gt_rgb = torch.clamp(gt_im.float(), 0, 1)
+                deshadowing_loss, deshadow_l1_loss, deshadow_ssim_loss, deshadow_dists_loss = _compute_deshadowing_loss(
+                    pred_rgb,
+                    gt_rgb,
+                    l1,
+                    ssim_loss_fn,
+                    dists_loss_fn,
+                    deshadow_loss_weights,
+                )
+                loss = deshadowing_loss
 
         if loss is None:
             raise ValueError(f"Unsupported training task: {task_name}")
@@ -480,6 +515,9 @@ def train(args):
         loss_dict['dew_edge_loss']=dewarp_edge_loss.item() if isinstance(dewarp_edge_loss,torch.Tensor) else 0
         loss_dict['app_loss']=appearance_loss.item() if isinstance(appearance_loss,torch.Tensor) else 0
         loss_dict['des_loss']=deshadowing_loss.item() if isinstance(deshadowing_loss,torch.Tensor) else 0
+        loss_dict['des_l1_loss']=deshadow_l1_loss.item() if isinstance(deshadow_l1_loss,torch.Tensor) else 0
+        loss_dict['des_ssim_loss']=deshadow_ssim_loss.item() if isinstance(deshadow_ssim_loss,torch.Tensor) else 0
+        loss_dict['des_dists_loss']=deshadow_dists_loss.item() if isinstance(deshadow_dists_loss,torch.Tensor) else 0
         loss_dict['deb_loss']=deblurring_loss.item() if isinstance(deblurring_loss,torch.Tensor) else 0
         loss_dict['bin_loss']=binarization_loss.item() if isinstance(binarization_loss,torch.Tensor) else 0
         end_time = time.time()
@@ -548,6 +586,12 @@ if __name__ == '__main__':
                         help='Weight for dewarping MS-SSIM loss on warped image')
     parser.add_argument('--dewarp_edge_weight', nargs='?', type=float, default=0.08,
                         help='Weight for dewarping mask edge alignment loss')
+    parser.add_argument('--deshadow_l1_weight', nargs='?', type=float, default=1.0,
+                        help='Weight for deshadowing L1 loss')
+    parser.add_argument('--deshadow_ssim_weight', nargs='?', type=float, default=0.25,
+                        help='Weight for deshadowing SSIM loss')
+    parser.add_argument('--deshadow_dists_weight', nargs='?', type=float, default=0.1,
+                        help='Weight for deshadowing DISTS perceptual loss')
     parser.set_defaults(tboard=False)
     args = parser.parse_args()
 
