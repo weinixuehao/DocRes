@@ -1,6 +1,7 @@
 import os
 import cv2 
 import time
+import glob
 import random 
 import argparse
 import numpy as np
@@ -18,6 +19,8 @@ from torch.utils.tensorboard import SummaryWriter
 from utils import dict2string,mkdir,get_lr,torch2cvimg,second2hours
 from loaders import docres_loader
 from models import restormer_arch
+from inference import dewarp_prompt, deshadow_prompt, appearance_prompt, deblur_prompt
+from data.preprocess.crop_merge_image import stride_integral
 
 
 def seed_torch(seed=1029):
@@ -38,6 +41,168 @@ def getBasecoord(h,w):
     base_coord1 = np.tile(np.arange(w).reshape(1,w),(h,1)).astype(np.float32)
     base_coord = np.concatenate((np.expand_dims(base_coord1,-1),np.expand_dims(base_coord0,-1)),-1)
     return base_coord
+
+
+def _is_image_file(path):
+    lower_path = path.lower()
+    return lower_path.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'))
+
+
+def _collect_eval_images():
+    eval_input_dir = './input/test'
+    if not os.path.isdir(eval_input_dir):
+        return []
+    all_paths = sorted(glob.glob(os.path.join(eval_input_dir, '*')))
+    image_paths = [p for p in all_paths if _is_image_file(p)]
+    return image_paths
+
+
+def _to_model_input(image_with_prompt, device):
+    image_with_prompt = image_with_prompt.astype(np.float32) / 255.0
+    return torch.from_numpy(image_with_prompt.transpose(2, 0, 1)).unsqueeze(0).to(
+        device=device,
+        dtype=torch.float32
+    )
+
+
+def _predict_uint8_image(model, model_input, task_name):
+    with torch.no_grad():
+        pred = model(model_input, task_name)
+        pred = torch.clamp(pred, 0, 1)
+        pred = pred[0].permute(1, 2, 0).cpu().numpy()
+    return (pred * 255).astype(np.uint8)
+
+
+def _infer_dewarp_stage(model, device, image_bgr, return_mask=False):
+    input_size = 256
+    im_org = image_bgr
+    im_masked, prompt_org = dewarp_prompt(im_org.copy())
+    h, w = im_masked.shape[:2]
+
+    im_masked = cv2.resize(im_masked, (input_size, input_size)).astype(np.float32) / 255.0
+    im_masked = torch.from_numpy(im_masked.transpose(2, 0, 1)).unsqueeze(0).to(device=device, dtype=torch.float32)
+
+    prompt = torch.from_numpy(prompt_org.transpose(2, 0, 1)).unsqueeze(0).to(device=device, dtype=torch.float32)
+    in_im = torch.cat((im_masked, prompt), dim=1)
+
+    base_coord = getBasecoord(input_size, input_size) / input_size
+    with torch.no_grad():
+        pred = model(in_im, 'dewarping')
+        pred = pred[0][:2].permute(1, 2, 0).cpu().numpy()
+        pred = pred + base_coord
+
+    for _ in range(15):
+        pred = cv2.blur(pred, (3, 3), borderType=cv2.BORDER_REPLICATE)
+    pred = cv2.resize(pred, (w, h)) * (w, h)
+    pred = pred.astype(np.float32)
+    out_im = cv2.remap(im_org, pred[:, :, 0], pred[:, :, 1], cv2.INTER_LINEAR)
+    if not return_mask:
+        return out_im
+
+    # prompt_org third channel stores dewarp foreground mask in [0, 1].
+    mask = np.clip(prompt_org[:, :, 2] * 255.0, 0, 255).astype(np.uint8)
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    return out_im, mask
+
+
+def _infer_shading_like_stage(model, device, image_bgr, task_name):
+    max_size = 1600
+    im_org = image_bgr
+    h, w = im_org.shape[:2]
+    prompt = deshadow_prompt(im_org) if task_name == 'deshadowing' else appearance_prompt(im_org)
+    in_im = np.concatenate((im_org, prompt), axis=-1)
+
+    use_stride = max(w, h) < max_size
+    if use_stride:
+        in_im, padding_h, padding_w = stride_integral(in_im, 8)
+    else:
+        in_im = cv2.resize(in_im, (max_size, max_size))
+
+    in_im = _to_model_input(in_im, device)
+    pred = _predict_uint8_image(model, in_im, task_name)
+    if use_stride:
+        out_im = pred[padding_h:, padding_w:]
+    else:
+        pred[pred == 0] = 1
+        shadow_map = cv2.resize(im_org, (max_size, max_size)).astype(np.float32) / pred.astype(np.float32)
+        shadow_map = cv2.resize(shadow_map, (w, h))
+        shadow_map[shadow_map == 0] = 0.00001
+        out_im = np.clip(im_org.astype(np.float32) / shadow_map, 0, 255).astype(np.uint8)
+    return out_im
+
+
+def _infer_deblur_stage(model, device, image_bgr):
+    im_org = image_bgr
+    in_im, padding_h, padding_w = stride_integral(im_org, 8)
+    prompt = deblur_prompt(in_im)
+    in_im = np.concatenate((in_im, prompt), axis=-1)
+    in_im = _to_model_input(in_im, device)
+    pred = _predict_uint8_image(model, in_im, 'deblurring')
+    out_im = pred[padding_h:, padding_w:]
+    return out_im
+
+
+def run_ckpt_visual_inference(model, device, args, current_iter, log_file_path):
+    eval_images = _collect_eval_images()
+    if not eval_images:
+        message = '[ckpt-eval] iter {}: skip, no valid images in ./input/test\n'.format(current_iter)
+        print(message.strip())
+        with open(log_file_path, 'a') as f:
+            f.write(message)
+        return
+
+    save_root = os.path.join(
+        args.logdir,
+        args.experiment_name,
+        'test',
+        f'iter_{current_iter:06d}'
+    )
+    mkdir(save_root)
+
+    was_training = model.training
+    model.eval()
+    model.float()
+
+    for img_path in eval_images:
+        try:
+            image = cv2.imread(img_path)
+            if image is None:
+                raise ValueError('cv2.imread failed')
+
+            image_name = os.path.splitext(os.path.basename(img_path))[0]
+            sample_dir = os.path.join(save_root, image_name)
+            mkdir(sample_dir)
+            cv2.imwrite(os.path.join(sample_dir, 'input.png'), image)
+
+            stage, dewarp_mask = _infer_dewarp_stage(model, device, image, return_mask=True)
+            cv2.imwrite(os.path.join(sample_dir, '00_mask.png'), dewarp_mask)
+            cv2.imwrite(os.path.join(sample_dir, '01_dewarp.png'), stage)
+
+            if args.train_stage == 'dewarp_pretrain':
+                stage_pipeline = []
+            else:
+                stage_pipeline = [
+                    ('02_deshadow.png', lambda im: _infer_shading_like_stage(model, device, im, 'deshadowing')),
+                    ('03_appearance.png', lambda im: _infer_shading_like_stage(model, device, im, 'appearance')),
+                    ('04_deblur.png', lambda im: _infer_deblur_stage(model, device, im)),
+                ]
+            for output_name, stage_fn in stage_pipeline:
+                stage = stage_fn(stage)
+                cv2.imwrite(os.path.join(sample_dir, output_name), stage)
+        except Exception as exc:
+            err_message = f'[ckpt-eval] iter {current_iter}: failed on {img_path} | {exc}\n'
+            print(err_message.strip())
+            with open(log_file_path, 'a') as f:
+                f.write(err_message)
+
+    done_message = f'[ckpt-eval] iter {current_iter}: saved to {save_root}\n'
+    print(done_message.strip())
+    with open(log_file_path, 'a') as f:
+        f.write(done_message)
+
+    if was_training:
+        model.train()
+
 
 def train(args):
     device = torch.device('cuda')
@@ -256,7 +421,15 @@ def train(args):
                      'optimizer_state' : optimizer.state_dict(),}
             if not os.path.exists(os.path.join(args.logdir,args.experiment_name)):
                  os.system('mkdir ' + os.path.join(args.logdir,args.experiment_name))
-            torch.save(state, os.path.join(args.logdir,args.experiment_name,"{}.pkl".format(iters+1)))
+            ckpt_path = os.path.join(args.logdir,args.experiment_name,"{}.pkl".format(iters+1))
+            torch.save(state, ckpt_path)
+            run_ckpt_visual_inference(
+                model=model,
+                device=device,
+                args=args,
+                current_iter=iters+1,
+                log_file_path=log_file_path
+            )
 
         sched.step()
         total_step += 1
