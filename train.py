@@ -43,6 +43,33 @@ def getBasecoord(h,w):
     return base_coord
 
 
+def _build_trainloaders(datasets_setting, args):
+    ratios = [dataset_setting['ratio'] for dataset_setting in datasets_setting]
+    datasets = [docres_loader.DocResTrainDataset(dataset=dataset_setting, img_size=args.im_size) for dataset_setting in datasets_setting]
+    trainloaders = []
+    for i in range(len(datasets)):
+        loader = data.DataLoader(
+            dataset=datasets[i],
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            drop_last=True,
+        )
+        if len(loader) == 0:
+            raise ValueError(
+                "Empty DataLoader for task '{}': dataset too small for batch_size={} with drop_last=True".format(
+                    datasets_setting[i]['task'], args.batch_size
+                )
+            )
+        trainloaders.append({'task': datasets_setting[i], 'loader': loader, 'iter_loader': iter(loader)})
+    return trainloaders, ratios
+
+
+def _train_stage_for_iter(iter_idx, stage1_iter):
+    return 'dewarp_pretrain' if iter_idx < stage1_iter else 'multitask'
+
+
 def _is_image_file(path):
     lower_path = path.lower()
     return lower_path.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'))
@@ -142,7 +169,7 @@ def _infer_deblur_stage(model, device, image_bgr):
     return out_im
 
 
-def run_ckpt_visual_inference(model, device, args, current_iter, log_file_path):
+def run_ckpt_visual_inference(model, device, args, current_iter, log_file_path, current_train_stage):
     eval_images = _collect_eval_images()
     if not eval_images:
         message = '[ckpt-eval] iter {}: skip, no valid images in ./input/test\n'.format(current_iter)
@@ -178,7 +205,7 @@ def run_ckpt_visual_inference(model, device, args, current_iter, log_file_path):
             cv2.imwrite(os.path.join(sample_dir, '00_mask.png'), dewarp_mask)
             cv2.imwrite(os.path.join(sample_dir, '01_dewarp.png'), stage)
 
-            if args.train_stage == 'dewarp_pretrain':
+            if current_train_stage == 'dewarp_pretrain':
                 stage_pipeline = []
             else:
                 stage_pipeline = [
@@ -207,6 +234,8 @@ def run_ckpt_visual_inference(model, device, args, current_iter, log_file_path):
 def train(args):
     device = torch.device('cuda')
     torch.cuda.manual_seed_all(42)
+    if args.stage1_iter >= args.total_iter:
+        raise ValueError("stage1_iter must be smaller than total_iter")
 
     ### Log file:
     mkdir(args.logdir)
@@ -228,25 +257,9 @@ def train(args):
         {'task':'deshadowing','ratio':1,'im_path':'/home/cl/workspace/dataset/deshadowing/','json_paths':['/home/cl/workspace/dataset/deshadowing/train.json']},
         {'task':'appearance','ratio':1,'im_path':'/home/cl/workspace/dataset/appearance/','json_paths':['/home/cl/workspace/dataset/appearance/train.json']}
         ]
-    if args.train_stage == 'dewarp_pretrain':
-        datasets_setting = [x for x in all_datasets_setting if x['task'] == 'dewarping']
-    else:
-        datasets_setting = all_datasets_setting
-
-
-    ratios = [dataset_setting['ratio'] for dataset_setting in datasets_setting]
-    datasets = [docres_loader.DocResTrainDataset(dataset=dataset_setting,img_size=args.im_size) for dataset_setting in datasets_setting]
-    trainloaders = []
-    for i in range(len(datasets)):
-        loader = data.DataLoader(
-            dataset=datasets[i],
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True,
-        )
-        trainloaders.append({'task': datasets_setting[i], 'loader': loader, 'iter_loader': iter(loader)})
+    dewarp_datasets_setting = [x for x in all_datasets_setting if x['task'] == 'dewarping']
+    trainloaders_dewarp, ratios_dewarp = _build_trainloaders(dewarp_datasets_setting, args)
+    trainloaders_all, ratios_all = _build_trainloaders(all_datasets_setting, args)
 
 
     ### test loader
@@ -284,68 +297,68 @@ def train(args):
 
         model_state = checkpoint.get('model_state', checkpoint)
         model.load_state_dict(model_state, strict=False)
-
-        if args.resume_model_only:
-            iter_start = 0
-            print("Loaded model weights only; optimizer and scheduler are re-initialized.")
-        else:
-            if 'optimizer_state' not in checkpoint:
-                raise KeyError(
-                    "Checkpoint '{}' missing required key 'optimizer_state'".format(args.resume)
-                )
+        iter_start = checkpoint.get('iters', checkpoint.get('iter', 0))
+        if 'optimizer_state' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state'])
-
-            iter_start = checkpoint.get('iters', checkpoint.get('iter', 0))
-            print("Loaded checkpoint '{}' (iter {})".format(args.resume, iter_start))
+        if 'scheduler_state' in checkpoint:
+            sched.load_state_dict(checkpoint['scheduler_state'])
+        print("Loaded checkpoint '{}' (iter {})".format(args.resume, iter_start))
 
     ###-----------------------------------------Training-----------------------------------------
     ##initialize
     loss_dict = {}
     total_step = iter_start
-    l2 = nn.MSELoss()
     l1 = nn.L1Loss()
     ce = nn.CrossEntropyLoss()
-    bce = nn.BCEWithLogitsLoss()
-    m = nn.Sigmoid()
-    best = 0
-    best_ce = 999
 
     ## total_steps
+    last_stage_name = None
     for iters in range(iter_start,args.total_iter):
         start_time = time.time()
-        loader_index = random.choices(list(range(len(trainloaders))),ratios)[0]
+        stage_name = _train_stage_for_iter(iters, args.stage1_iter)
+        if stage_name != last_stage_name:
+            phase_msg = f"Switch training stage at iter {iters}: {stage_name}"
+            print(phase_msg)
+            with open(log_file_path, 'a') as f:
+                f.write(phase_msg + '\n')
+            last_stage_name = stage_name
+
+        active_trainloaders = trainloaders_dewarp if stage_name == 'dewarp_pretrain' else trainloaders_all
+        active_ratios = ratios_dewarp if stage_name == 'dewarp_pretrain' else ratios_all
+
+        loader_index = random.choices(list(range(len(active_trainloaders))),active_ratios)[0]
 
         try:
-            in_im,gt_im = next(trainloaders[loader_index]['iter_loader'])
+            in_im,gt_im = next(active_trainloaders[loader_index]['iter_loader'])
         except StopIteration:
-            trainloaders[loader_index]['iter_loader']=iter(trainloaders[loader_index]['loader'])
-            in_im,gt_im = next(trainloaders[loader_index]['iter_loader'])
+            active_trainloaders[loader_index]['iter_loader']=iter(active_trainloaders[loader_index]['loader'])
+            in_im,gt_im = next(active_trainloaders[loader_index]['iter_loader'])
         in_im = in_im.float().cuda()
         gt_im = gt_im.float().cuda()
 
         binarization_loss,appearance_loss,dewarping_loss,deblurring_loss,deshadowing_loss = 0,0,0,0,0
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            pred_im = model(in_im,trainloaders[loader_index]['task']['task'])
-            if trainloaders[loader_index]['task']['task'] == 'binarization':
+            task_name = active_trainloaders[loader_index]['task']['task']
+            pred_im = model(in_im,task_name)
+            if task_name == 'binarization':
                 gt_im = gt_im.long()
                 binarization_loss = ce(pred_im[:,:2,:,:], gt_im[:,0,:,:])
                 loss = binarization_loss
-            elif trainloaders[loader_index]['task']['task'] == 'dewarping':
+            elif task_name == 'dewarping':
                 dewarping_loss = l1(pred_im[:,:2,:,:], gt_im[:,:2,:,:])
                 loss = dewarping_loss
-            elif trainloaders[loader_index]['task']['task'] == 'appearance':
+            elif task_name == 'appearance':
                 appearance_loss = l1(pred_im, gt_im)
                 loss = appearance_loss
-            elif trainloaders[loader_index]['task']['task'] == 'deblurring':
+            elif task_name == 'deblurring':
                 deblurring_loss = l1(pred_im, gt_im)
                 loss = deblurring_loss
-            elif trainloaders[loader_index]['task']['task'] == 'deshadowing':
+            elif task_name == 'deshadowing':
                 deshadowing_loss = l1(pred_im, gt_im)
                 loss = deshadowing_loss
 
         # TensorBoard image visualization for sampled task.
         if args.tboard and (iters + 1) % args.vis_interval == 0:
-            task_name = trainloaders[loader_index]['task']['task']
             input_vis = torch.clamp(in_im[:, :3, :, :], 0, 1)
             prompt_vis = torch.clamp(in_im[:, 3:6, :, :], 0, 1)
             writer.add_images(f'Vis/{task_name}/input', input_vis[:2], total_step)
@@ -394,6 +407,7 @@ def train(args):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        sched.step()
     
         loss_dict['dew_loss']=dewarping_loss.item() if isinstance(dewarping_loss,torch.Tensor) else 0
         loss_dict['app_loss']=appearance_loss.item() if isinstance(appearance_loss,torch.Tensor) else 0
@@ -405,20 +419,21 @@ def train(args):
         ## log
         if (iters+1) % 10 == 0:
             ## print
-            print('iters [{}/{}] -- '.format(iters+1,args.total_iter)+dict2string(loss_dict)+' --lr {:6f}'.format(get_lr(optimizer))+' -- time {}'.format(second2hours(duration*(args.total_iter-iters))))
+            print('iters [{}/{}] [{}] -- '.format(iters+1,args.total_iter,stage_name)+dict2string(loss_dict)+' --lr {:6f}'.format(get_lr(optimizer))+' -- time {}'.format(second2hours(duration*(args.total_iter-iters))))
             ## tbord
             if args.tboard:
                 for key,value in loss_dict.items():
                     writer.add_scalar('Train '+key+'/Iterations', value, total_step)
             ## logfile
             with open(log_file_path,'a') as f:
-                f.write('iters [{}/{}] -- '.format(iters+1,args.total_iter)+dict2string(loss_dict)+' --lr {:6f}'.format(get_lr(optimizer))+' -- time {}'.format(second2hours(duration*(args.total_iter-iters)))+'\n')
+                f.write('iters [{}/{}] [{}] -- '.format(iters+1,args.total_iter,stage_name)+dict2string(loss_dict)+' --lr {:6f}'.format(get_lr(optimizer))+' -- time {}'.format(second2hours(duration*(args.total_iter-iters)))+'\n')
 
 
         if (iters+1) % 5000 == 0:
             state = {'iters': iters+1,
                      'model_state': model.state_dict(),
-                     'optimizer_state' : optimizer.state_dict(),}
+                     'optimizer_state' : optimizer.state_dict(),
+                     'scheduler_state': sched.state_dict(),}
             if not os.path.exists(os.path.join(args.logdir,args.experiment_name)):
                  os.system('mkdir ' + os.path.join(args.logdir,args.experiment_name))
             ckpt_path = os.path.join(args.logdir,args.experiment_name,"{}.pkl".format(iters+1))
@@ -428,10 +443,9 @@ def train(args):
                 device=device,
                 args=args,
                 current_iter=iters+1,
-                log_file_path=log_file_path
+                log_file_path=log_file_path,
+                current_train_stage=stage_name
             )
-
-        sched.step()
         total_step += 1
 
 
@@ -440,7 +454,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Hyperparams')
     parser.add_argument('--im_size', nargs='?', type=int, default=512, 
                         help='Height of the input image')
-    parser.add_argument('--total_iter', nargs='?', type=int, default=100000, 
+    parser.add_argument('--total_iter', nargs='?', type=int, default=350000, 
                         help='# of the epochs')
     parser.add_argument('--batch_size', nargs='?', type=int, default=10, 
                         help='Batch Size')
@@ -448,8 +462,6 @@ if __name__ == '__main__':
                         help='Learning Rate')
     parser.add_argument('--resume', nargs='?', type=str, default=None,    
                         help='Path to previous saved model to restart from')
-    parser.add_argument('--resume_model_only', action='store_true',
-                        help='Only load model weights when resuming')
     parser.add_argument('--logdir', nargs='?', type=str, default='./checkpoints/',    
                         help='Path to store the loss logs')
     parser.add_argument('--tboard', dest='tboard', action='store_true', 
@@ -458,9 +470,8 @@ if __name__ == '__main__':
                         help='the name of this experiment')
     parser.add_argument('--vis_interval', nargs='?', type=int, default=200,
                         help='Iterations interval for tensorboard image visualization')
-    parser.add_argument('--train_stage', nargs='?', type=str, default='multitask',
-                        choices=['multitask', 'dewarp_pretrain'],
-                        help='Training stage selector')
+    parser.add_argument('--stage1_iter', nargs='?', type=int, default=100000,
+                        help='Train dewarping only before this iteration')
     parser.set_defaults(tboard=False)
     args = parser.parse_args()
 
