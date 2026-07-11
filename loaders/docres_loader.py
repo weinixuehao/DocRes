@@ -11,6 +11,42 @@ import torch.nn.functional as F
 from torch.utils import data
 import glob
 
+DEWARP_CANONICAL_SIZE = 448
+
+
+def _load_uvdoc_mat(path, key):
+    import h5py as h5
+    with h5.File(path, 'r') as file:
+        return np.array(file[key][:]).astype(np.float32)
+
+
+def _uvdoc_grid2d_to_bm(grid2d, out_h, out_w, src_h, src_w):
+    sx = out_w / float(src_w)
+    sy = out_h / float(src_h)
+    x = cv2.resize(grid2d[0], (out_w, out_h), interpolation=cv2.INTER_LINEAR) * sx
+    y = cv2.resize(grid2d[1], (out_w, out_h), interpolation=cv2.INTER_LINEAR) * sy
+    return np.stack([x, y], axis=-1)
+
+
+def _load_uvdoc_dewarp_sample(im_path, geom_name):
+    in_im = cv2.imread(im_path)
+    if in_im is None:
+        raise FileNotFoundError(im_path)
+    root = os.path.dirname(os.path.dirname(im_path))
+    src_h, src_w = in_im.shape[:2]
+
+    grid2d = _load_uvdoc_mat(os.path.join(root, 'grid2d', f'{geom_name}.mat'), 'grid2d')
+    grid2d = grid2d.T.transpose(2, 0, 1)
+
+    seg = _load_uvdoc_mat(os.path.join(root, 'seg', f'{geom_name}.mat'), 'seg').T
+    mask = (seg > 0.5).astype(np.uint8) * 255
+
+    in_im = cv2.resize(in_im, (DEWARP_CANONICAL_SIZE, DEWARP_CANONICAL_SIZE))
+    mask = cv2.resize(mask, (DEWARP_CANONICAL_SIZE, DEWARP_CANONICAL_SIZE), interpolation=cv2.INTER_NEAREST)
+    bm = _uvdoc_grid2d_to_bm(grid2d, DEWARP_CANONICAL_SIZE, DEWARP_CANONICAL_SIZE, src_h, src_w)
+    return in_im, mask, bm
+
+
 class DocResTrainDataset(data.Dataset):
     def __init__(self, dataset={}, img_size=384,):
         json_paths = dataset['json_paths']
@@ -50,10 +86,17 @@ class DocResTrainDataset(data.Dataset):
             dtsprompt  = self.rgbim_transform(dtsprompt)
         elif task =='dewarping':
             ## image prepare
-            in_im = cv2.imread(os.path.join(self.im_path,data['in_path']))
-            mask = cv2.imread(os.path.join(self.im_path,data['mask_path']))[:,:,0]
-            bm = np.load(os.path.join(self.im_path,data['gt_path'])).astype(np.float32)  #-> 0-448
-            bm = cv2.resize(bm,(448,448))
+            sample_root = data.get('im_root', self.im_path)
+            if 'geom_name' in data:
+                in_im, mask, bm = _load_uvdoc_dewarp_sample(
+                    os.path.join(sample_root, data['in_path']),
+                    data['geom_name'],
+                )
+            else:
+                in_im = cv2.imread(os.path.join(sample_root,data['in_path']))
+                mask = cv2.imread(os.path.join(sample_root,data['mask_path']))[:,:,0]
+                bm = np.load(os.path.join(sample_root,data['gt_path'])).astype(np.float32)  #-> 0-448
+                bm = cv2.resize(bm, (DEWARP_CANONICAL_SIZE, DEWARP_CANONICAL_SIZE))
             ## add background when background assets are available
             if len(self.background_paths) > 0:
                 background = cv2.imread(random.choice(self.background_paths))
@@ -63,15 +106,16 @@ class DocResTrainDataset(data.Dataset):
                 shift_x = np.random.randint(0,background.shape[0]-crop_size)
                 background = background[shift_x:shift_x+crop_size,shift_y:shift_y+crop_size,:]
                 background = cv2.resize(background,(448,448))
-                if np.mean(in_im[mask==0])<10:
-                    in_im[mask==0]=background[mask==0]
+                bg_mask = (mask == 0)
+                if bg_mask.any() and np.mean(in_im[bg_mask]) < 10:
+                    in_im[bg_mask] = background[bg_mask]
             ## random crop and get prompt
             in_im,mask,bm = self.random_margin_bm(in_im,mask,bm) # bm-> 0-1
             in_im = cv2.resize(in_im,(self.size,self.size))
             mask = cv2.resize(mask,(self.size,self.size))
             mask_aug = self.mask_augment(mask)
             in_im[mask_aug==0]=0 
-            bm = cv2.resize(bm,(self.size,self.size)) # bm-> 0-1
+            bm = cv2.resize(bm, (self.size, self.size))  # bm-> 0-1
             bm_shift = (bm*self.size - self.getBasecoord(self.size,self.size))/self.size
             base_coord = self.getBasecoord(self.size,self.size)/self.size
 
@@ -261,11 +305,14 @@ class DocResTrainDataset(data.Dataset):
         l = max(0,l)
         r = max(0,r)
 
+        crop_h = size[0] - t - b
+        crop_w = size[1] - l - r
         in_im = in_im[t:size[0]-b,l:size[1]-r]
         msk = msk[t:size[0]-b,l:size[1]-r]
-        bm[:,:,1]=bm[:,:,1]-t
-        bm[:,:,0]=bm[:,:,0]-l
-        bm=bm/np.array([448-l-r, 448-t-b])
+        bm = bm[t:size[0]-b,l:size[1]-r].copy()
+        bm[:,:,0] = bm[:,:,0] - l
+        bm[:,:,1] = bm[:,:,1] - t
+        bm = bm / np.array([crop_w, crop_h], dtype=np.float32)
 
         return in_im,msk,bm
 
@@ -586,7 +633,10 @@ if __name__ == '__main__':
             'task': 'dewarping',
             'ratio': 1,
             'im_path': '/home/cl/workspace/dataset/dewarp/doc3d/data/raw/',
-            'json_paths': ['/home/cl/workspace/dataset/dewarp/doc3d/train.json'],
+            'json_paths': [
+                '/home/cl/workspace/dataset/dewarp/doc3d/train.json',
+                '/home/cl/workspace/dataset/dewarp/uvdoc/train.json',
+            ],
         },
         'binarization': {
             'task': 'binarization',

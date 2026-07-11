@@ -87,6 +87,16 @@ def _sample_by_grid(image, grid, mode='bilinear'):
     )
 
 
+def _normalize_flow_mag(mag, mask, quantile=0.95):
+    masked_mag = mag * mask
+    valid = masked_mag[mask > 0.5]
+    if valid.numel() == 0:
+        scale = mag.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+    else:
+        scale = torch.quantile(valid, quantile).clamp(min=1e-6)
+    return (masked_mag / scale).clamp(0, 1)
+
+
 def _mask_edge_loss(pred_mask, gt_mask):
     pred_dx = pred_mask[:, :, :, 1:] - pred_mask[:, :, :, :-1]
     pred_dy = pred_mask[:, :, 1:, :] - pred_mask[:, :, :-1, :]
@@ -143,6 +153,45 @@ def _compute_deshadowing_loss(pred_rgb, gt_rgb, l1_fn, ssim_fn, dists_fn, weight
         + weights['dists'] * dists_loss
     )
     return total_loss, l1_loss, ssim_loss, dists_loss
+
+
+def _gradient_l1(pred, gt):
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    gt_dx = gt[:, :, :, 1:] - gt[:, :, :, :-1]
+    gt_dy = gt[:, :, 1:, :] - gt[:, :, :-1, :]
+    return F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
+
+
+def _dice_loss(logits, target, eps=1e-6):
+    prob = F.softmax(logits, dim=1)[:, 0]
+    target = (target == 0).float()
+    inter = (prob * target).sum(dim=(1, 2))
+    union = prob.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
+    return 1.0 - ((2.0 * inter + eps) / (union + eps)).mean()
+
+
+def _compute_deblurring_loss(pred_rgb, gt_rgb, l1_fn, ms_ssim_fn, weights):
+    pred_rgb = torch.clamp(pred_rgb, 0, 1)
+    gt_rgb = torch.clamp(gt_rgb, 0, 1)
+
+    l1_loss = l1_fn(pred_rgb, gt_rgb)
+    ms_ssim_loss = ms_ssim_fn(pred_rgb, gt_rgb)
+    grad_loss = _gradient_l1(pred_rgb, gt_rgb)
+
+    total_loss = (
+        weights['l1'] * l1_loss
+        + weights['ms_ssim'] * ms_ssim_loss
+        + weights['grad'] * grad_loss
+    )
+    return total_loss, l1_loss, ms_ssim_loss, grad_loss
+
+
+def _compute_binarization_loss(logits, target, ce_fn, weights):
+    ce_loss = ce_fn(logits, target)
+    dice_loss = _dice_loss(logits, target)
+    total_loss = weights['ce'] * ce_loss + weights['dice'] * dice_loss
+    return total_loss, ce_loss, dice_loss
 
 
 def _is_image_file(path):
@@ -327,7 +376,10 @@ def train(args):
     ### Setup Dataloader
     all_datasets_setting = [
         {'task':'deblurring','ratio':1,'im_path':'/home/cl/workspace/dataset/deblurring/','json_paths':['/home/cl/workspace/dataset/deblurring/train.json']},
-        {'task':'dewarping','ratio':1,'im_path':'/home/cl/workspace/dataset/dewarp/doc3d/data/raw/','json_paths':['/home/cl/workspace/dataset/dewarp/doc3d/train.json']},
+        {'task':'dewarping','ratio':1,'im_path':'/home/cl/workspace/dataset/dewarp/doc3d/data/raw/','json_paths':[
+            '/home/cl/workspace/dataset/dewarp/doc3d/train.json',
+            '/home/cl/workspace/dataset/dewarp/uvdoc/train.json',
+        ]},
         {'task':'binarization','ratio':1,'im_path':'/home/cl/workspace/dataset/binarization/','json_paths':['/home/cl/workspace/dataset/binarization/train.json']},
         {'task':'deshadowing','ratio':1,'im_path':'/home/cl/workspace/dataset/deshadowing/','json_paths':['/home/cl/workspace/dataset/deshadowing/train.json']},
         {'task':'appearance','ratio':1,'im_path':'/home/cl/workspace/dataset/appearance/','json_paths':['/home/cl/workspace/dataset/appearance/train.json']}
@@ -391,6 +443,20 @@ def train(args):
         'ssim': args.deshadow_ssim_weight,
         'dists': args.deshadow_dists_weight,
     }
+    appearance_loss_weights = {
+        'l1': args.appearance_l1_weight,
+        'ssim': args.appearance_ssim_weight,
+        'dists': args.appearance_dists_weight,
+    }
+    deblur_loss_weights = {
+        'l1': args.deblur_l1_weight,
+        'ms_ssim': args.deblur_ms_ssim_weight,
+        'grad': args.deblur_grad_weight,
+    }
+    binarization_loss_weights = {
+        'ce': args.binarization_ce_weight,
+        'dice': args.binarization_dice_weight,
+    }
 
     ## total_steps
     last_stage_name = None
@@ -420,19 +486,48 @@ def train(args):
         binarization_loss,appearance_loss,dewarping_loss,deblurring_loss,deshadowing_loss = 0,0,0,0,0
         dewarp_l1_loss,dewarp_ms_loss,dewarp_edge_loss = 0,0,0
         deshadow_l1_loss,deshadow_ssim_loss,deshadow_dists_loss = 0,0,0
+        app_l1_loss,app_ssim_loss,app_dists_loss = 0,0,0
+        deb_l1_loss,deb_ms_loss,deb_grad_loss = 0,0,0
+        bin_ce_loss,bin_dice_loss = 0,0
         loss = None
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             task_name = active_trainloaders[loader_index]['task']['task']
             pred_im = model(in_im,task_name)
-            if task_name == 'binarization':
-                gt_im = gt_im.long()
-                binarization_loss = ce(pred_im[:,:2,:,:], gt_im[:,0,:,:])
+
+        if task_name == 'binarization':
+            with torch.amp.autocast('cuda', enabled=False):
+                gt_mask = gt_im[:, 0, :, :].long()
+                binarization_loss, bin_ce_loss, bin_dice_loss = _compute_binarization_loss(
+                    pred_im[:, :2, :, :].float(),
+                    gt_mask,
+                    ce,
+                    binarization_loss_weights,
+                )
                 loss = binarization_loss
-            elif task_name == 'appearance':
-                appearance_loss = l1(pred_im, gt_im)
+        elif task_name == 'appearance':
+            with torch.amp.autocast('cuda', enabled=False):
+                pred_rgb = torch.clamp(pred_im.float(), 0, 1)
+                gt_rgb = torch.clamp(gt_im.float(), 0, 1)
+                appearance_loss, app_l1_loss, app_ssim_loss, app_dists_loss = _compute_deshadowing_loss(
+                    pred_rgb,
+                    gt_rgb,
+                    l1,
+                    ssim_loss_fn,
+                    dists_loss_fn,
+                    appearance_loss_weights,
+                )
                 loss = appearance_loss
-            elif task_name == 'deblurring':
-                deblurring_loss = l1(pred_im, gt_im)
+        elif task_name == 'deblurring':
+            with torch.amp.autocast('cuda', enabled=False):
+                pred_rgb = torch.clamp(pred_im.float(), 0, 1)
+                gt_rgb = torch.clamp(gt_im.float(), 0, 1)
+                deblurring_loss, deb_l1_loss, deb_ms_loss, deb_grad_loss = _compute_deblurring_loss(
+                    pred_rgb,
+                    gt_rgb,
+                    l1,
+                    ms_ssim_loss,
+                    deblur_loss_weights,
+                )
                 loss = deblurring_loss
 
         if task_name == 'dewarping':
@@ -484,10 +579,11 @@ def train(args):
             elif task_name == 'dewarping':
                 pred_flow = pred_im[:, :2, :, :].float()
                 gt_flow = gt_im[:, :2, :, :].float()
+                flow_mask = gt_im[:, 2:3, :, :].float()
                 pred_mag = torch.norm(pred_flow, dim=1, keepdim=True)
                 gt_mag = torch.norm(gt_flow, dim=1, keepdim=True)
-                pred_vis = pred_mag / (pred_mag.max() + 1e-6)
-                gt_vis = gt_mag / (gt_mag.max() + 1e-6)
+                pred_vis = _normalize_flow_mag(pred_mag, flow_mask)
+                gt_vis = _normalize_flow_mag(gt_mag, flow_mask)
                 pred_vis = pred_vis.repeat(1, 3, 1, 1)
                 gt_vis = gt_vis.repeat(1, 3, 1, 1)
                 writer.add_images(f'Vis/{task_name}/mask', gt_im[:, 2:3, :, :].repeat(1, 3, 1, 1)[:2], total_step)
@@ -514,12 +610,20 @@ def train(args):
         loss_dict['dew_ms_loss']=dewarp_ms_loss.item() if isinstance(dewarp_ms_loss,torch.Tensor) else 0
         loss_dict['dew_edge_loss']=dewarp_edge_loss.item() if isinstance(dewarp_edge_loss,torch.Tensor) else 0
         loss_dict['app_loss']=appearance_loss.item() if isinstance(appearance_loss,torch.Tensor) else 0
+        loss_dict['app_l1_loss']=app_l1_loss.item() if isinstance(app_l1_loss,torch.Tensor) else 0
+        loss_dict['app_ssim_loss']=app_ssim_loss.item() if isinstance(app_ssim_loss,torch.Tensor) else 0
+        loss_dict['app_dists_loss']=app_dists_loss.item() if isinstance(app_dists_loss,torch.Tensor) else 0
         loss_dict['des_loss']=deshadowing_loss.item() if isinstance(deshadowing_loss,torch.Tensor) else 0
         loss_dict['des_l1_loss']=deshadow_l1_loss.item() if isinstance(deshadow_l1_loss,torch.Tensor) else 0
         loss_dict['des_ssim_loss']=deshadow_ssim_loss.item() if isinstance(deshadow_ssim_loss,torch.Tensor) else 0
         loss_dict['des_dists_loss']=deshadow_dists_loss.item() if isinstance(deshadow_dists_loss,torch.Tensor) else 0
         loss_dict['deb_loss']=deblurring_loss.item() if isinstance(deblurring_loss,torch.Tensor) else 0
+        loss_dict['deb_l1_loss']=deb_l1_loss.item() if isinstance(deb_l1_loss,torch.Tensor) else 0
+        loss_dict['deb_ms_loss']=deb_ms_loss.item() if isinstance(deb_ms_loss,torch.Tensor) else 0
+        loss_dict['deb_grad_loss']=deb_grad_loss.item() if isinstance(deb_grad_loss,torch.Tensor) else 0
         loss_dict['bin_loss']=binarization_loss.item() if isinstance(binarization_loss,torch.Tensor) else 0
+        loss_dict['bin_ce_loss']=bin_ce_loss.item() if isinstance(bin_ce_loss,torch.Tensor) else 0
+        loss_dict['bin_dice_loss']=bin_dice_loss.item() if isinstance(bin_dice_loss,torch.Tensor) else 0
         end_time = time.time()
         duration = end_time-start_time
         ## log
@@ -592,6 +696,22 @@ if __name__ == '__main__':
                         help='Weight for deshadowing SSIM loss')
     parser.add_argument('--deshadow_dists_weight', nargs='?', type=float, default=0.1,
                         help='Weight for deshadowing DISTS perceptual loss')
+    parser.add_argument('--appearance_l1_weight', nargs='?', type=float, default=1.0,
+                        help='Weight for appearance L1 loss')
+    parser.add_argument('--appearance_ssim_weight', nargs='?', type=float, default=0.25,
+                        help='Weight for appearance SSIM loss')
+    parser.add_argument('--appearance_dists_weight', nargs='?', type=float, default=0.1,
+                        help='Weight for appearance DISTS perceptual loss')
+    parser.add_argument('--deblur_l1_weight', nargs='?', type=float, default=1.0,
+                        help='Weight for deblurring L1 loss')
+    parser.add_argument('--deblur_ms_ssim_weight', nargs='?', type=float, default=0.2,
+                        help='Weight for deblurring MS-SSIM loss')
+    parser.add_argument('--deblur_grad_weight', nargs='?', type=float, default=0.08,
+                        help='Weight for deblurring gradient L1 loss')
+    parser.add_argument('--binarization_ce_weight', nargs='?', type=float, default=1.0,
+                        help='Weight for binarization cross-entropy loss')
+    parser.add_argument('--binarization_dice_weight', nargs='?', type=float, default=0.5,
+                        help='Weight for binarization dice loss')
     parser.set_defaults(tboard=False)
     args = parser.parse_args()
 
